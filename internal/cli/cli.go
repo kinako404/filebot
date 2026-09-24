@@ -19,7 +19,7 @@ import (
 )
 
 // Version 是构建版本号，构建时可用 -ldflags 覆盖。
-var Version = "2.1.1"
+var Version = "2.1.2"
 
 const usage = `filebot - 监控目录，把新增/更新的图片、视频发送到 Telegram
 
@@ -310,7 +310,7 @@ func runInstallService(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&stateDir, "state-dir", "", "状态目录（默认 /var/lib/<name>）")
 	fs.StringVar(&opts.Root, "root", "/", "安装根目录（离线镜像/测试用）")
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "只打印将要执行的操作，不写任何文件")
-	fs.BoolVar(&opts.Force, "force", false, "覆盖已存在的单元文件")
+	fs.BoolVar(&opts.Force, "force", false, "跳过“已覆盖已有单元文件”的提示")
 	fs.BoolVar(&noStart, "no-start", false, "不启动服务")
 	fs.BoolVar(&noEnable, "no-enable", false, "不设置开机自启")
 	fs.Usage = func() {

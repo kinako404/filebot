@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -228,5 +229,109 @@ func TestSocks5HandshakeAgainstClosedPort(t *testing.T) {
 	}
 	if _, err := clientFor(transport).Get("https://127.0.0.1:1/"); err == nil {
 		t.Fatal("应当报错")
+	}
+}
+
+// 代理链接里的 user:password 不能出现在错误信息里（journal 是持久化的），
+// 但仍要保留主机名之类的定位信息。
+func TestProxyErrorRedactsCredentials(t *testing.T) {
+	cases := []struct {
+		raw      string
+		password string
+		apiHost  string // 脱敏后仍要保留的定位信息
+	}{
+		{"http://user:secret@/", "secret", "缺少主机名"},
+		{"socks5://user:secret@", "secret", "缺少主机名"},
+		{"socks5://user:secret@host:port", "secret", "host:port"},
+		{"http://user:pa ss@host:80", "pa ss", "host:80"},
+	}
+	for _, item := range cases {
+		_, err := New(item.raw, time.Second)
+		if err == nil {
+			t.Fatalf("%q 应当报错", item.raw)
+		}
+		if strings.Contains(err.Error(), item.password) {
+			t.Fatalf("%q 的错误泄露了口令：%v", item.raw, err)
+		}
+		if !strings.Contains(err.Error(), "***") {
+			t.Fatalf("%q 的错误应当用 *** 顶掉凭据：%v", item.raw, err)
+		}
+		if !strings.Contains(err.Error(), item.apiHost) {
+			t.Fatalf("%q 的错误应当仍可读（含 %s）：%v", item.raw, item.apiHost, err)
+		}
+	}
+	// 没有凭据的链接不该被动过
+	if _, err := New("http://user:secret@127.0.0.1:8080", time.Second); err != nil {
+		t.Fatalf("合法链接不该报错：%v", err)
+	}
+}
+
+// 黑洞代理：收下连接但永不回包，用来验证 New 的 timeout 真的生效。
+type blackholeProxy struct {
+	listener net.Listener
+	mu       sync.Mutex
+	conns    map[net.Conn]struct{}
+}
+
+func newBlackholeProxy(t *testing.T) *blackholeProxy {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hole := &blackholeProxy{listener: listener, conns: map[net.Conn]struct{}{}}
+	go hole.serve()
+	t.Cleanup(hole.Close)
+	return hole
+}
+
+func (h *blackholeProxy) Addr() string { return h.listener.Addr().String() }
+
+func (h *blackholeProxy) Close() {
+	_ = h.listener.Close()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for conn := range h.conns {
+		_ = conn.Close()
+	}
+}
+
+func (h *blackholeProxy) serve() {
+	for {
+		conn, err := h.listener.Accept()
+		if err != nil {
+			return
+		}
+		h.mu.Lock()
+		h.conns[conn] = struct{}{}
+		h.mu.Unlock()
+		go func(conn net.Conn) {
+			defer func() {
+				h.mu.Lock()
+				delete(h.conns, conn)
+				h.mu.Unlock()
+			}()
+			_, _ = io.Copy(io.Discard, conn)
+		}(conn)
+	}
+}
+
+// New 的 timeout 必须真的用在 SOCKS5 握手上：黑洞代理下，
+// 硬编码 30s 的兜底会让请求挂满 30s，而 800ms 的 timeout 应当很快失败。
+func TestNewAppliesTimeoutToSocks5Handshake(t *testing.T) {
+	hole := newBlackholeProxy(t)
+	transport, err := New("socks5://"+hole.Addr(), 800*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 故意不给 http.Client 设 Timeout：这里验证的是 New 的 timeout
+	start := time.Now()
+	_, err = (&http.Client{Transport: transport}).Get("http://127.0.0.1:1/")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("黑洞代理应当导致请求失败")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("New 的 timeout 没生效：耗时 %v（期望 800ms 量级，硬编码 30s 时会是 30s）", elapsed)
 	}
 }

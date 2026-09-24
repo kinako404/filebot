@@ -98,3 +98,31 @@ systemd 单元渲染与安装流程（假 systemctl + 临时 root）、以及编
 仍未验证：真实代理节点、真实 ffmpeg 输出质量（用桩程序覆盖调用链路）。
 未在用户机器上真正安装 systemd 服务（会写入 /etc 并启用一个需要 token 的服务），
 仅用 `--dry-run`、临时 root 全流程与 `systemd-analyze verify` 验证。
+
+## 8. CR 修复记录（2026-09-25，v2.1.2）
+
+一次 5 个 reviewer 的并行只读审查找出并修掉了这些真问题（每条都有能真正失败的新测试，
+并用"回退修复 → 测试必须变红"的变异验证确认过）：
+
+| 问题 | 影响 | 修法 |
+|---|---|---|
+| 常驻模式的基准快照在 `getMe` 自检之后才拍 | 自检（含重试，可能几十秒）期间新增的文件被当成"启动前就存在"，永远不发 | 先拍基准快照再自检 |
+| `watch.dirs` 指向符号链接目录 | 静默监控不到任何文件（`WalkDir` 用 Lstat 看根条目） | `EvalSymlinks` 解析根目录 + 跟随文件级符号链接 |
+| `send_original=false` 且无可用转换工具 | 一条消息都没发却被记为"已发送"，`once` 也永远跳过 | 用 `delivered` 计数，只有真发出去才写状态 |
+| `poll_interval=0/负数` | `timer.Reset(0)` 变成全速扫盘的忙循环 | 钳到 100ms 下限 |
+| 退出时还在去抖窗口里的文件 | 静默丢失，重启后也不会再发 | 退出前最多再等 `settle`（上限 10s）补发，来不及的记日志 |
+| `once` 有 60 秒硬上限 | 大批量补发静默只发一部分却返回 0 | 不设上限，且有文件失败时返回非 0 |
+| `Content-Length` 与实际字节来自两次 stat | 上传期间文件变化必然失败，重试还复用过期长度 | 每次尝试重建请求体（重新 stat） |
+| `http.Client` 跟随重定向 | `api_base` 为 http 时 POST 被降级成无 body 的 GET，文件没上传 | `CheckRedirect` 返回 `ErrUseLastResponse`，3xx 报明确错误 |
+| 429 + 非 JSON body | 接入层限流页被当成永久错误 | 按状态码分类，429/408/425/5xx 仍可重试 |
+| token / 代理口令进错误信息 | 写进 stderr 与持久化 journal | 错误文本脱敏，`Unwrap` 链保持以不破坏错误分类 |
+| `proxy.New` 的 `timeout` 被忽略 | 配置项不生效，黑洞代理下卡满 `telegram.timeout` | 真正用于拨号与握手 deadline |
+| 图片转码产物不校验 | `photo_max_mb` 形同虚设，超限副本被递出去后被 API 拒绝 | 校验产物大小并降质重试，最终放弃 |
+| `Preparer.Close` 与并发 `Prepare` | 关停时对 `workDir` 的数据竞态、静默回落到系统临时目录 | 加锁 + `closed` 标志 |
+| `uninstall-service --purge` | 会整目录删掉用户用 `-c/--state-dir` 指定的路径 | 只删配置文件/状态文件；目录只在本包默认路径上删 |
+| 生成的配置 0600 属 root，服务以 `User=filebot` 跑 | 默认安装路径下服务读不到配置，反复重启 | 安装时把配置 chown 给服务用户 |
+| 配置存在但仍是空模板 | 二次安装会 enable/start 一个必然崩溃的服务 | 用 `config.Load+Validate` 判断"可用"才 enable/start |
+| `ExecStart` 路径不含引号 | 带空格的路径被 systemd 切词，静默截断 | 按 systemd 规则加引号转义 |
+
+已知未修（记录在 README 的"已知限制"里）：多接收方时只要有任一接收方成功即记为已发送，
+因此当时失败的那个接收方不会再收到该版本；彻底修需要把状态按 `路径+接收方` 维度记录。

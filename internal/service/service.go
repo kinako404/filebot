@@ -14,6 +14,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
+
+	"filebot/internal/config"
 )
 
 // 默认路径（相对 --root）。
@@ -92,19 +95,28 @@ func (o *Options) paths() (paths, error) {
 	if err != nil {
 		return paths{}, err
 	}
-	config := o.ConfigPath
-	if config == "" {
-		config = inRoot(o.Root, defaultConfDir, "config.toml")
+	configPath := inRoot(o.Root, defaultConfDir, "config.toml")
+	if o.ConfigPath != "" {
+		// 和 config 包的读取侧保持一致：先展开 ~，否则会在 CWD 下造出一个名为 "~" 的目录
+		expanded, err := config.ExpandPath(o.ConfigPath)
+		if err != nil {
+			return paths{}, fmt.Errorf("解析配置文件路径失败：%w", err)
+		}
+		configPath = expanded
 	}
-	stateDir := o.StateDir
-	if stateDir == "" {
-		stateDir = inRoot(o.Root, defaultStateDir, "")
+	stateDir := inRoot(o.Root, defaultStateDir, "")
+	if o.StateDir != "" {
+		expanded, err := config.ExpandPath(o.StateDir)
+		if err != nil {
+			return paths{}, fmt.Errorf("解析状态目录失败：%w", err)
+		}
+		stateDir = expanded
 	}
 	return paths{
 		root:     o.Root,
 		unit:     inRoot(o.Root, "/etc/systemd/system", o.UnitName+".service"),
 		bin:      bin,
-		config:   config,
+		config:   configPath,
 		stateDir: stateDir,
 	}, nil
 }
@@ -139,9 +151,9 @@ func RenderUnit(p Params) string {
 		b.WriteString("User=" + p.User + "\n")
 		b.WriteString("Group=" + p.User + "\n")
 	}
-	b.WriteString("ExecStart=" + p.BinPath + " run -c " + p.ConfigPath + "\n")
+	b.WriteString("ExecStart=" + quoteArg(p.BinPath) + " run -c " + quoteArg(p.ConfigPath) + "\n")
 	if p.WorkDir != "" {
-		b.WriteString("WorkingDirectory=" + p.WorkDir + "\n")
+		b.WriteString("WorkingDirectory=" + quoteArg(p.WorkDir) + "\n")
 	}
 	b.WriteString("Restart=always\n")
 	b.WriteString("RestartSec=5\n")
@@ -157,6 +169,24 @@ func RenderUnit(p Params) string {
 	b.WriteString("SyslogIdentifier=" + p.UnitName + "\n")
 	b.WriteString("\n[Install]\n")
 	b.WriteString("WantedBy=multi-user.target\n")
+	return b.String()
+}
+
+// quoteArg 按 systemd 的规则转义一个参数：含空白、引号或反斜杠时整体加双引号，
+// 并把内部的 \ 与 " 转义；否则原样返回，避免带空格的路径被 systemd 当成两个参数。
+func quoteArg(value string) string {
+	if value != "" && !strings.ContainsAny(value, " \t\n\"'\\") {
+		return value
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range value {
+		if r == '\\' || r == '"' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('"')
 	return b.String()
 }
 
@@ -238,8 +268,15 @@ func Install(opts Options) error {
 	if _, err := os.Stat(p.config); err != nil {
 		configMissing = true
 	}
-	start := opts.Start && !configMissing
-	enable := opts.Enable && !configMissing
+	// 配置不存在（马上要写一份空模板）或存在但没填好（例如第二次安装时还是空 token）
+	// 时都不能 enable/start：那样只会拉起一个启动即退出的服务，被 Restart=always 反复重启刷日志。
+	var configErr error
+	if !configMissing {
+		configErr = configProblem(p.config)
+	}
+	usable := !configMissing && configErr == nil
+	start := opts.Start && usable
+	enable := opts.Enable && usable
 
 	if opts.DryRun {
 		fmt.Fprintf(out, "== 干跑模式，不会写入任何文件 ==\n")
@@ -253,6 +290,9 @@ func Install(opts Options) error {
 			fmt.Fprintf(out, "useradd       : %s\n", orDefault(lookPath("useradd"), "未找到"))
 		}
 		fmt.Fprintf(out, "enable/start  : enable=%v start=%v\n", enable, start)
+		if !usable {
+			fmt.Fprintf(out, "注意          : %s，实际不会 enable/start\n", unusableReason(configMissing, configErr))
+		}
 		fmt.Fprintf(out, "\n---- %s ----\n%s", filepath.Base(p.unit), unit)
 		return nil
 	}
@@ -274,6 +314,14 @@ func Install(opts Options) error {
 			return fmt.Errorf("写入配置模板失败：%w", err)
 		}
 		fmt.Fprintf(out, "已生成配置模板：%s（请填入 token / chat_id / 监控目录）\n", p.config)
+	}
+
+	if err := ensureConfigOwner(opts, p.config); err != nil {
+		return err
+	}
+	if !usable {
+		fmt.Fprintf(out, "%s，已跳过 enable/start；填好后运行 systemctl enable --now %s\n",
+			unusableReason(configMissing, configErr), opts.UnitName)
 	}
 
 	if err := verifyUnit(opts, unit); err != nil {
@@ -345,7 +393,11 @@ func Uninstall(opts Options, purge bool) error {
 		fmt.Fprintf(out, "将删除单元文件：%s\n", p.unit)
 		if purge {
 			fmt.Fprintf(out, "将删除配置：%s\n", p.config)
-			fmt.Fprintf(out, "将删除状态目录：%s\n", p.stateDir)
+			if opts.StateDir == "" {
+				fmt.Fprintf(out, "将删除状态目录：%s\n", p.stateDir)
+			} else {
+				fmt.Fprintf(out, "将删除状态目录里的状态文件（保留目录）：%s\n", p.stateDir)
+			}
 			if opts.User != "" {
 				fmt.Fprintf(out, "将删除系统用户：%s\n", opts.User)
 			}
@@ -370,22 +422,30 @@ func Uninstall(opts Options, purge bool) error {
 	fmt.Fprintf(out, "已删除单元文件：%s\n", p.unit)
 
 	if opts.Root == "/" && lookPath("systemctl") != "" {
-		if _, err := opts.runner("systemctl", "daemon-reload"); err != nil {
-			return fmt.Errorf("systemctl daemon-reload 失败：%w", err)
-		}
-		if _, err := opts.runner("systemctl", "reset-failed", opts.UnitName); err != nil {
-			fmt.Fprintf(out, "systemctl reset-failed 忽略：%v\n", err)
-		}
+		// daemon-reload 失败只是 systemd 状态没刷新，不能因此中断后面的清理
+		reloadSystemd(opts)
 	}
 
 	if purge {
-		for _, dir := range []string{filepath.Dir(p.config), p.stateDir} {
-			if err := os.RemoveAll(dir); err != nil {
-				fmt.Fprintf(out, "删除 %s 失败：%v\n", dir, err)
-			} else {
-				fmt.Fprintf(out, "已删除：%s\n", dir)
-			}
+		// 配置文件只删文件本身：-c 指向的目录里可能还有用户的其它文件，绝不能整目录删
+		if err := os.Remove(p.config); err != nil && !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(out, "删除配置文件失败：%v\n", err)
+		} else {
+			fmt.Fprintf(out, "已删除配置：%s\n", p.config)
 		}
+
+		// 目录只在本包自己算出来的默认路径上删；用户显式指定的路径一律保留目录本身
+		confDir := inRoot(opts.Root, defaultConfDir, "")
+		if opts.ConfigPath == "" && filepath.Clean(filepath.Dir(p.config)) == filepath.Clean(confDir) {
+			removeDir(out, confDir)
+		}
+		stateDir := inRoot(opts.Root, defaultStateDir, "")
+		if opts.StateDir == "" && filepath.Clean(p.stateDir) == filepath.Clean(stateDir) {
+			removeDir(out, stateDir)
+		} else {
+			removeStateFiles(out, p.stateDir)
+		}
+
 		if opts.User != "" && opts.Root == "/" {
 			if err := removeUser(opts, opts.User); err != nil {
 				fmt.Fprintf(out, "删除用户失败（可忽略）：%v\n", err)
@@ -483,6 +543,86 @@ func prepareStateDir(opts Options, stateDir string) error {
 	return nil
 }
 
+// unusableReason 说明为什么不能交给服务启动。
+func unusableReason(configMissing bool, configErr error) string {
+	if configMissing {
+		return "配置还不存在"
+	}
+	return fmt.Sprintf("配置还没填好（%v）", configErr)
+}
+
+// configProblem 判断已有配置文件能不能直接交给服务用：存在但没填好/解析失败时返回原因。
+// 文件不存在不算问题，安装器会写一份模板。
+func configProblem(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	cfg, err := config.Load(path, config.Overrides{})
+	if err != nil {
+		return err
+	}
+	return cfg.Validate()
+}
+
+// ensureConfigOwner 把配置文件交给服务用户：默认 0600 + root 属主时服务读不到 token。
+// 只在真实根目录（Root 为 "/"）且指定了服务用户时生效。
+func ensureConfigOwner(opts Options, path string) error {
+	if opts.User == "" || opts.Root != "/" {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	account, err := user.Lookup(opts.User)
+	if err != nil {
+		return nil
+	}
+	uid, err1 := strconv.Atoi(account.Uid)
+	gid, err2 := strconv.Atoi(account.Gid)
+	if err1 != nil || err2 != nil {
+		return nil
+	}
+	if !configUnreadable(info, uid, gid) {
+		// 服务用户已经读得到（例如 filebot 属主，或权限本就够宽）就不动属主，
+		// 避免悄悄改掉用户自己放过来的文件
+		return nil
+	}
+	fmt.Fprint(opts.Out, configOwnerWarning(path, opts.User, info.Mode().Perm()))
+	if err := os.Chown(path, uid, gid); err != nil {
+		return fmt.Errorf("设置配置文件属主失败：%w", err)
+	}
+	return nil
+}
+
+// configUnreadable 判断配置文件对目标用户是否读不到：只比属主/属组与权限位，不切换身份。
+func configUnreadable(info os.FileInfo, uid, gid int) bool {
+	if uid == 0 { // root 不受权限位限制
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	perm := info.Mode().Perm()
+	if perm&0o004 != 0 { // 其他人可读
+		return false
+	}
+	if int(stat.Uid) == uid {
+		return perm&0o400 == 0
+	}
+	if int(stat.Gid) == gid {
+		return perm&0o040 == 0
+	}
+	return true
+}
+
+// configOwnerWarning 是不可读配置的修复提示。
+func configOwnerWarning(path, userName string, perm os.FileMode) string {
+	return fmt.Sprintf("警告：%s 的属主/权限（%04o）让服务用户 %s 读不到，服务会因 EACCES 反复重启；\n"+
+		"      修复：chown %s %s\n", path, perm, userName, userName, path)
+}
+
 func removeUser(opts Options, name string) error {
 	userdel := lookPath("userdel")
 	if userdel == "" {
@@ -490,6 +630,75 @@ func removeUser(opts Options, name string) error {
 	}
 	_, err := opts.runner(userdel, name)
 	return err
+}
+
+// dangerousDirs 是绝不允许整目录删除的系统目录。
+var dangerousDirs = map[string]bool{
+	"/":     true,
+	"/etc":  true,
+	"/usr":  true,
+	"/home": true,
+	"/root": true,
+	"/var":  true,
+	"/tmp":  true,
+}
+
+// removableDir 检查目录是否可以整目录删除：相对路径与系统目录一律拒绝。
+func removableDir(dir string) error {
+	clean := filepath.Clean(dir)
+	if !filepath.IsAbs(clean) {
+		return fmt.Errorf("拒绝删除相对路径：%s", dir)
+	}
+	if dangerousDirs[clean] {
+		return fmt.Errorf("拒绝删除系统目录：%s", dir)
+	}
+	return nil
+}
+
+// safeRemoveDir 只删"确定是安装器自己建的目录"：宁可留个空目录也不要误删用户的目录。
+func safeRemoveDir(dir string) error {
+	if err := removableDir(dir); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("删除目录 %s 失败：%w", dir, err)
+	}
+	return nil
+}
+
+func removeDir(out io.Writer, dir string) {
+	if err := safeRemoveDir(dir); err != nil {
+		fmt.Fprintf(out, "%v（跳过）\n", err)
+		return
+	}
+	fmt.Fprintf(out, "已删除目录：%s\n", dir)
+}
+
+// removeStateFiles 只删状态目录里的状态文件，保留目录本身。
+func removeStateFiles(out io.Writer, dir string) {
+	targets := []string{filepath.Join(dir, "state.json")}
+	if leftovers, err := filepath.Glob(filepath.Join(dir, ".state-*")); err == nil {
+		targets = append(targets, leftovers...)
+	}
+	for _, path := range targets {
+		if err := os.Remove(path); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				fmt.Fprintf(out, "删除状态文件失败：%v\n", err)
+			}
+			continue
+		}
+		fmt.Fprintf(out, "已删除状态文件：%s\n", path)
+	}
+}
+
+// reloadSystemd 让 systemd 重新读取单元；失败只提示，不能中断 --purge 的清理。
+func reloadSystemd(opts Options) {
+	if _, err := opts.runner("systemctl", "daemon-reload"); err != nil {
+		fmt.Fprintf(opts.Out, "systemctl daemon-reload 未成功（忽略，不影响清理）：%v\n", err)
+	}
+	if _, err := opts.runner("systemctl", "reset-failed", opts.UnitName); err != nil {
+		fmt.Fprintf(opts.Out, "systemctl reset-failed 忽略：%v\n", err)
+	}
 }
 
 func runCommand(name string, args ...string) (string, error) {

@@ -20,12 +20,16 @@ import (
 )
 
 // New 按代理链接构造 http.Transport。rawURL 为空时返回直连 transport。
+// timeout 是拨号（含 SOCKS5 握手）超时，<=0 时回落到 30s。
 func New(rawURL string, timeout time.Duration) (*http.Transport, error) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
 	transport := &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext,
 		MaxIdleConns:          16,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   30 * time.Second,
+		TLSHandshakeTimeout:   timeout,
 		ExpectContinueTimeout: 10 * time.Second,
 		ForceAttemptHTTP2:     true,
 	}
@@ -36,12 +40,13 @@ func New(rawURL string, timeout time.Duration) (*http.Transport, error) {
 
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("代理链接无法解析：%w", err)
+		// url.Parse 的报错里带原始链接（含 user:password），只留脱敏后的链接
+		return nil, fmt.Errorf("代理链接无法解析：%s", redactProxyURL(rawURL))
 	}
 	scheme := strings.ToLower(parsed.Scheme)
 	host := parsed.Hostname()
 	if host == "" {
-		return nil, fmt.Errorf("代理链接缺少主机名：%s", rawURL)
+		return nil, fmt.Errorf("代理链接缺少主机名：%s", redactProxyURL(rawURL))
 	}
 
 	switch scheme {
@@ -67,13 +72,38 @@ func New(rawURL string, timeout time.Duration) (*http.Transport, error) {
 			username = parsed.User.Username()
 			password, _ = parsed.User.Password()
 		}
-		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 		transport.Proxy = nil
 		transport.DialContext = socks5DialContext(net.JoinHostPort(host, port), username, password, dialer)
 		return transport, nil
 	default:
 		return nil, fmt.Errorf("不支持的代理协议 %q：只支持 http:// 与 socks5://，留空表示直连", scheme)
 	}
+}
+
+// redactProxyURL 把链接里的用户名/口令换成 ***，主机名与端口保留，
+// 免得代理口令被拼进错误信息、进而写进 journal。
+func redactProxyURL(raw string) string {
+	if parsed, err := url.Parse(raw); err == nil && parsed.User == nil {
+		// 解析得出来、又没有 userinfo，原样返回（别把路径里的 @ 当凭据）
+		return raw
+	}
+	// 其余情况一律按文本打码：url.User 会把 * 转义成 %2A，读起来费劲，
+	// 链接解析失败时也只能这么办。
+	return maskUserinfoText(raw)
+}
+
+// maskUserinfoText 把 scheme:// 与最后一个 @ 之间的内容打码。
+func maskUserinfoText(raw string) string {
+	start := 0
+	if idx := strings.Index(raw, "://"); idx >= 0 {
+		start = idx + 3
+	}
+	at := strings.LastIndex(raw, "@")
+	if at < start {
+		return raw
+	}
+	return raw[:start] + "***" + raw[at:]
 }
 
 // socks5DialContext 返回一个通过 SOCKS5 代理建连的 DialContext（RFC 1928 + RFC 1929）。
@@ -86,7 +116,12 @@ func socks5DialContext(proxyAddr, username, password string, dialer *net.Dialer)
 		if deadline, ok := ctx.Deadline(); ok {
 			_ = conn.SetDeadline(deadline)
 		} else {
-			_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+			// 没有 ctx 截止时间时用拨号超时兜底，别让黑洞代理把握手永久挂住
+			fallback := dialer.Timeout
+			if fallback <= 0 {
+				fallback = 30 * time.Second
+			}
+			_ = conn.SetDeadline(time.Now().Add(fallback))
 		}
 		if err := socks5Handshake(conn, address, username, password); err != nil {
 			conn.Close()

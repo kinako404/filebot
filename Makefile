@@ -1,5 +1,5 @@
 BINARY  := filebot
-VERSION := 2.1.1
+VERSION := 2.1.2
 LDFLAGS := -s -w -X filebot/internal/cli.Version=$(VERSION)
 
 .PHONY: all build linux-amd64 test vet fmt clean install-service

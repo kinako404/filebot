@@ -4,10 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"mime"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -367,5 +372,190 @@ func TestNonJSONServerErrorIsRetried(t *testing.T) {
 	}
 	if len(fake.CallsOf("sendPhoto")) != 2 {
 		t.Fatalf("5xx 应当重试，实际 %d 次", len(fake.CallsOf("sendPhoto")))
+	}
+}
+
+// 429 但 body 是 HTML（接入层/CDN 的限流页很常见）同样要退避重试
+func TestNonJSONRateLimitIsRetried(t *testing.T) {
+	fake := testsupport.NewFakeTelegram()
+	defer fake.Close()
+	fake.ScriptRaw(429, "<html>rate limited by cdn</html>")
+	client := newTestClient(t, fake, nil)
+	if err := client.SendPhoto(context.Background(), "1", writeFile(t, "a.jpg", 100), ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(fake.CallsOf("sendPhoto")); got != 2 {
+		t.Fatalf("非 JSON 的 429 应当重试，实际 %d 次", got)
+	}
+}
+
+// 非 JSON 的 400 重试没有意义，仍然是不可重试的 APIError
+func TestNonJSONBadRequestIsNotRetried(t *testing.T) {
+	fake := testsupport.NewFakeTelegram()
+	defer fake.Close()
+	fake.ScriptRaw(400, "<html>bad</html>")
+	client := newTestClient(t, fake, nil)
+	err := client.SendPhoto(context.Background(), "1", writeFile(t, "a.jpg", 100), "")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("应当是 APIError：%v", err)
+	}
+	if apiErr.Code != 400 || !strings.Contains(apiErr.Description, "bad") {
+		t.Fatalf("apiErr = %+v", apiErr)
+	}
+	if IsRetryable(err) {
+		t.Error("4xx 不该是可重试类型")
+	}
+	if got := len(fake.CallsOf("sendPhoto")); got != 1 {
+		t.Fatalf("4xx 不该重试，实际 %d 次", got)
+	}
+}
+
+// 重试必须重新 os.Stat：文件在两次尝试之间变大，
+// 旧实现复用同一个过期长度，net/http 会以长度不符直接失败。
+func TestRetryRestatsFileLength(t *testing.T) {
+	fake := testsupport.NewFakeTelegram()
+	defer fake.Close()
+	fake.ScriptMethod("sendDocument", 500, map[string]any{"ok": false, "description": "boom"})
+
+	path := writeFile(t, "grow.bin", 4096)
+	// 第一次请求被服务端完整读完之后再改文件大小
+	fake.OnCall(func(call testsupport.Call) {
+		if call.Method == "sendDocument" && len(fake.CallsOf("sendDocument")) == 1 {
+			payload := make([]byte, 9000)
+			for i := range payload {
+				payload[i] = byte(i % 251)
+			}
+			_ = os.WriteFile(path, payload, 0o644)
+		}
+	})
+
+	client := newTestClient(t, fake, nil)
+	if err := client.SendDocument(context.Background(), "1", path, ""); err != nil {
+		t.Fatalf("重试应当成功（每次尝试都重新 stat）：%v", err)
+	}
+	calls := fake.CallsOf("sendDocument")
+	if len(calls) != 2 {
+		t.Fatalf("调用次数 = %d，期望 2", len(calls))
+	}
+	second := calls[1]
+	if got := len(second.Files["document"].Data); got != 9000 {
+		t.Fatalf("第二次应当发新长度 9000，实际 %d", got)
+	}
+	if want := multipartLength(t, second); second.BodyLength != want {
+		t.Fatalf("声明的 Content-Length %d != 实际字节数 %d", second.BodyLength, want)
+	}
+}
+
+// fileContentType 复刻 upload 的推断逻辑，供 multipartLength 重建请求体用
+func fileContentType(name string) string {
+	if contentType := mime.TypeByExtension(strings.ToLower(filepath.Ext(name))); contentType != "" {
+		return contentType
+	}
+	return "application/octet-stream"
+}
+
+// multipartLength 按服务端收到的内容重建请求体应有的字节数：
+// 声明的 Content-Length 必须与它相等，否则 net/http 会写出截断的请求。
+func multipartLength(t *testing.T, call testsupport.Call) int64 {
+	t.Helper()
+	_, params, err := mime.ParseMediaType(call.ContentType)
+	if err != nil {
+		t.Fatalf("Content-Type 解析失败：%v", err)
+	}
+	boundary := params["boundary"]
+	if boundary == "" {
+		t.Fatalf("Content-Type 缺少 boundary：%q", call.ContentType)
+	}
+	var total int64
+	part := func(headers string, body []byte) {
+		total += int64(len("--"+boundary+"\r\n") + len(headers) + len(body) + len("\r\n"))
+	}
+	for name, value := range call.Fields {
+		part(fmt.Sprintf("Content-Disposition: form-data; name=%q\r\n\r\n", name), []byte(value))
+	}
+	for name, file := range call.Files {
+		headers := fmt.Sprintf(
+			"Content-Disposition: form-data; name=%q; filename=%q\r\nContent-Type: %s\r\n\r\n",
+			name, escapeFilename(file.Filename), fileContentType(file.Filename),
+		)
+		part(headers, file.Data)
+	}
+	total += int64(len("--" + boundary + "--\r\n"))
+	return total
+}
+
+// 跟随重定向会把上传静默降级成没有 body 的 GET，
+// 如果中转对 GET 回 ok:true，上层还会以为文件已经发出去了。
+func TestRedirectIsNotFollowed(t *testing.T) {
+	var mu sync.Mutex
+	var hits []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits = append(hits, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path != "/redirected" {
+			w.Header().Set("Location", "/redirected")
+			w.WriteHeader(http.StatusMovedPermanently)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
+	}))
+	defer server.Close()
+
+	// token 用真实长度（真实 Bot token 是 <数字>:<长串>）：
+	// 脱敏是按子串替换的，一两个字符的假 token 会把无关文本也顶掉。
+	client, err := New(Options{Token: "123456:SECRET-TOKEN", APIBase: server.URL, Timeout: 5 * time.Second, MaxRetries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.SendMessage(context.Background(), "1", "hi")
+	if err == nil {
+		t.Fatal("301 必须报错，不能跟随成 GET 后当成发送成功")
+	}
+	if !strings.Contains(err.Error(), "301") {
+		t.Fatalf("错误信息里应当有状态码 301：%v", err)
+	}
+	if !strings.Contains(err.Error(), "/redirected") {
+		t.Fatalf("错误信息里应当带上 Location（方便定位）：%v", err)
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != 301 {
+		t.Fatalf("应当是 HTTP 301 的 APIError：%v", err)
+	}
+	if IsRetryable(err) {
+		t.Error("重定向不该是可重试错误")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hits) != 1 {
+		t.Fatalf("不该跟随重定向，实际收到的请求：%v", hits)
+	}
+}
+
+// token 会出现在请求 URL 里，http.Client.Do 的报错又整条带出去，
+// 配置写错 crash-loop 时会被反复写进持久化的 journal，必须脱敏。
+func TestErrorsDoNotLeakToken(t *testing.T) {
+	const token = "123456:SECRET-TOKEN"
+	client, err := New(Options{Token: token, APIBase: "http://127.0.0.1:1", Timeout: 2 * time.Second, MaxRetries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.SendPhoto(context.Background(), "1", writeFile(t, "a.jpg", 16), "")
+	if err == nil {
+		t.Fatal("应当报错")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("错误信息泄露了 token：%v", err)
+	}
+	if !strings.Contains(err.Error(), "<token>") {
+		t.Fatalf("应当把 token 换成占位符：%v", err)
+	}
+	if !strings.Contains(err.Error(), "127.0.0.1") {
+		t.Fatalf("脱敏后仍要保留定位信息（主机）：%v", err)
+	}
+	if !IsRetryable(err) {
+		t.Fatalf("连接错误仍应当是可重试类型：%v", err)
 	}
 }

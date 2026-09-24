@@ -9,11 +9,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -82,10 +84,13 @@ type Prepared struct {
 type Preparer struct {
 	photoMax int64
 	videoMax int64
-	workDir  string
-	ownDir   bool
-	ffmpeg   string
-	magick   string
+
+	mu      sync.Mutex // 保护 workDir/closed：Close 可能与仍在跑的 Prepare 并发
+	workDir string
+	ownDir  bool
+	closed  bool
+	ffmpeg  string
+	magick  string
 }
 
 // NewPreparer 创建 Preparer；workDir 为空时用系统临时目录。
@@ -109,7 +114,11 @@ func NewPreparer(photoMax, videoMax int64, workDir string) (*Preparer, error) {
 }
 
 // WorkDir 返回临时目录。
-func (p *Preparer) WorkDir() string { return p.workDir }
+func (p *Preparer) WorkDir() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.workDir
+}
 
 // Capabilities 描述本机可用的转换工具。
 func (p *Preparer) Capabilities() string {
@@ -126,14 +135,20 @@ func (p *Preparer) Capabilities() string {
 	return strings.Join(tools, ", ")
 }
 
-// Close 清理临时目录。
+// Close 清理临时目录。可以安全地与仍在跑的 Prepare 并发调用。
 func (p *Preparer) Close() error {
-	if p.ownDir && p.workDir != "" {
-		err := os.RemoveAll(p.workDir)
-		p.workDir = ""
-		return err
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil
 	}
-	return nil
+	p.closed = true
+	var err error
+	if p.ownDir && p.workDir != "" {
+		err = os.RemoveAll(p.workDir)
+	}
+	p.workDir = ""
+	return err
 }
 
 // Prepare 生成可点开副本。转换不可行时返回 ErrNoConverter。
@@ -180,27 +195,48 @@ func (p *Preparer) convertImage(source string) (*Prepared, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p.ffmpeg != "" {
-		args := []string{
-			"-y", "-loglevel", "error", "-i", source,
-			"-vf", fmt.Sprintf("scale='min(%d,iw)':-2", maxPhotoSide),
-			"-frames:v", "1", "-q:v", "3", target,
+	// 画质/尺寸递减重试：产物必须真的能塞进内联上限才回传
+	attempts := []struct {
+		side    int
+		quality int
+	}{{maxPhotoSide, 3}, {1600, 8}, {1280, 14}}
+	for _, attempt := range attempts {
+		if p.ffmpeg != "" {
+			args := []string{
+				"-y", "-loglevel", "error", "-i", source,
+				"-vf", fmt.Sprintf("scale='min(%d,iw)':-2", attempt.side),
+				"-frames:v", "1", "-q:v", strconv.Itoa(attempt.quality), target,
+			}
+			if err := run(p.ffmpeg, args); err == nil && p.validPhoto(target) {
+				return &Prepared{Kind: InlinePhoto, Path: target, Temp: true, Note: "ffmpeg"}, nil
+			}
 		}
-		if err := run(p.ffmpeg, args); err == nil {
-			return &Prepared{Kind: InlinePhoto, Path: target, Temp: true, Note: "ffmpeg"}, nil
-		}
-	}
-	if p.magick != "" {
-		args := []string{
-			source, "-resize", fmt.Sprintf("%dx%d>", maxPhotoSide, maxPhotoSide),
-			"-quality", "88", target,
-		}
-		if err := run(p.magick, args); err == nil {
-			return &Prepared{Kind: InlinePhoto, Path: target, Temp: true, Note: "imagemagick"}, nil
+		if p.magick != "" {
+			args := []string{
+				source, "-resize", fmt.Sprintf("%dx%d>", attempt.side, attempt.side),
+				"-quality", "88", target,
+			}
+			if err := run(p.magick, args); err == nil && p.validPhoto(target) {
+				return &Prepared{Kind: InlinePhoto, Path: target, Temp: true, Note: "imagemagick"}, nil
+			}
 		}
 	}
 	_ = os.Remove(target)
 	return nil, ErrNoConverter
+}
+
+// validPhoto 校验转换产物：存在、非空、且不超过图片内联上限。
+func (p *Preparer) validPhoto(target string) bool {
+	info, err := os.Stat(target)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return false
+	}
+	if info.Size() > p.photoMax {
+		slog.Debug("转换产物仍超过图片上限，继续降质重试",
+			"path", target, "size", info.Size(), "limit", p.photoMax)
+		return false
+	}
+	return true
 }
 
 func (p *Preparer) convertVideo(source string) (*Prepared, error) {
@@ -237,6 +273,11 @@ func (p *Preparer) convertVideo(source string) (*Prepared, error) {
 }
 
 func (p *Preparer) tempFile(source, suffix string) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || p.workDir == "" {
+		return "", errors.New("转换器已关闭")
+	}
 	stem := strings.TrimSuffix(filepath.Base(source), filepath.Ext(source))
 	if len(stem) > 48 {
 		stem = stem[:48]

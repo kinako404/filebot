@@ -246,3 +246,76 @@ func TestStat(t *testing.T) {
 		t.Fatal("不存在的文件应当 ok=false")
 	}
 }
+
+// 监控目录本身是符号链接时必须照样工作（/media -> /mnt/disk/media 很常见）
+func TestSymlinkedRootDirectoryIsFollowed(t *testing.T) {
+	real := t.TempDir()
+	linked := filepath.Join(t.TempDir(), "linked")
+	if err := os.Symlink(real, linked); err != nil {
+		t.Skipf("本机不支持符号链接：%v", err)
+	}
+	path := filepath.Join(real, "a.jpg")
+	if err := os.WriteFile(path, make([]byte, 42), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w := New(config.Watch{Dirs: []string{linked}, SettleSeconds: 0, ScanExisting: true})
+	ready := w.Poll(time.Now())
+	if len(ready) != 1 || ready[0].Size != 42 {
+		t.Fatalf("符号链接根目录应当被解析并扫描到文件，实际 %v", ready)
+	}
+
+	snapshot := (&Watcher{dirs: []string{linked}}).Snapshot()
+	if len(snapshot) != 1 {
+		t.Fatalf("Snapshot 应当跟随符号链接根目录，实际 %v", snapshot)
+	}
+}
+
+// 目录里指向真实文件的符号链接也要算数（与 Python 版一致）
+func TestSymlinkedFileIsIncluded(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real.jpg")
+	if err := os.WriteFile(real, make([]byte, 7), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias.jpg")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skipf("本机不支持符号链接：%v", err)
+	}
+	snapshot := (&Watcher{dirs: []string{root}}).Snapshot()
+	if _, ok := snapshot[alias]; !ok {
+		t.Fatalf("指向普通文件的符号链接应当被收录，实际 %v", snapshot)
+	}
+}
+
+// 轮询间隔必须钳到下限，否则 0 会变成全速扫盘的忙循环
+func TestPollIntervalIsClamped(t *testing.T) {
+	if got := New(config.Watch{Dirs: []string{t.TempDir()}, PollInterval: 0}).pollInterval; got < minPollInterval {
+		t.Fatalf("poll_interval=0 应当被钳到 %v，实际 %v", minPollInterval, got)
+	}
+	if got := New(config.Watch{Dirs: []string{t.TempDir()}, PollInterval: -5}).pollInterval; got < minPollInterval {
+		t.Fatalf("负数应当被钳到 %v，实际 %v", minPollInterval, got)
+	}
+	if got := New(config.Watch{Dirs: []string{t.TempDir()}, PollInterval: 0.5}).pollInterval; got != 500*time.Millisecond {
+		t.Fatalf("正常值不该被改动，实际 %v", got)
+	}
+	if got := New(config.Watch{Dirs: []string{t.TempDir()}, SettleSeconds: -1}).settle; got != 0 {
+		t.Fatalf("负 settle 应当归零，实际 %v", got)
+	}
+}
+
+// Pending 应当反映还在去抖窗口里的文件
+func TestPendingReportsWaitingFiles(t *testing.T) {
+	h := newHarness(t)
+	w := h.watcher(nil)
+	w.Poll(time.Unix(0, 0))
+	path := h.write("waiting.jpg", 2048)
+	w.Poll(time.Unix(1, 0))
+	pending := w.Pending()
+	if len(pending) != 1 || pending[0] != path {
+		t.Fatalf("pending = %v，期望 [%s]", pending, path)
+	}
+	w.Poll(time.Unix(10, 0))
+	if len(w.Pending()) != 0 {
+		t.Fatalf("产出之后不该再有 pending：%v", w.Pending())
+	}
+}

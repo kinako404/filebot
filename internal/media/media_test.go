@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -201,5 +202,82 @@ func TestCloseRemovesOwnWorkDir(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatal("Close 应当删除临时目录")
+	}
+}
+
+// 图片转换产物必须真的能塞进内联上限，否则应当降质重试、最终放弃而不是把超限副本递出去。
+func TestConvertedImageMustFitPhotoLimit(t *testing.T) {
+	dir := t.TempDir()
+	stubDir := t.TempDir()
+	// 桩工具无视输入，直接写 20MB，模拟"转出来还是太大"
+	script := `#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do out="$1"; shift; done
+dd if=/dev/zero of="$out" bs=1M count=20 2>/dev/null
+`
+	tool := filepath.Join(stubDir, "ffmpeg")
+	if err := os.WriteFile(tool, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := newPreparer(t, 1<<20, 50<<20, tool, "")
+	source := writeFile(t, dir, "scan.bmp", 2048)
+
+	if _, err := p.Prepare(source, KindImage); !errors.Is(err, ErrNoConverter) {
+		t.Fatalf("产超限时应当放弃并返回 ErrNoConverter，实际 %v", err)
+	}
+	// 不能留下临时垃圾
+	leftovers, err := os.ReadDir(p.WorkDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("放弃后不该留下临时文件：%v", leftovers)
+	}
+}
+
+// 产物在限额内时正常返回
+func TestConvertedImageWithinLimitIsReturned(t *testing.T) {
+	dir := t.TempDir()
+	stubDir := t.TempDir()
+	ffmpeg := stubTool(t, stubDir, "ffmpeg")
+	p := newPreparer(t, 1<<20, 50<<20, ffmpeg, "")
+	got, err := p.Prepare(writeFile(t, dir, "scan.bmp", 2048), KindImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(got.Path)
+	if err != nil || info.Size() == 0 || info.Size() > 1<<20 {
+		t.Fatalf("产物不合法：%v %d", err, info.Size())
+	}
+}
+
+// Close 与 Prepare 并发调用不应发生竞态，也不该把临时目录回落到系统临时目录
+func TestCloseIsSafeWithConcurrentPrepare(t *testing.T) {
+	dir := t.TempDir()
+	stubDir := t.TempDir()
+	ffmpeg := stubTool(t, stubDir, "ffmpeg")
+	p := newPreparer(t, 10<<20, 50<<20, ffmpeg, "")
+	source := writeFile(t, dir, "scan.bmp", 2048)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = p.Prepare(source, KindImage)
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = p.Close()
+	}()
+	wg.Wait()
+	if p.WorkDir() != "" {
+		t.Fatalf("Close 之后 WorkDir 应当为空，实际 %q", p.WorkDir())
+	}
+	// 关闭后再 Prepare 必须明确失败，而不是偷偷用系统临时目录
+	if _, err := p.Prepare(source, KindImage); err == nil {
+		t.Fatal("关闭后 Prepare 应当报错")
 	}
 }

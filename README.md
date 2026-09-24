@@ -40,7 +40,7 @@ cp config.example.toml config.toml && vim config.toml
 |---|---|
 | `filebot run [选项]` | 常驻监控（不带子命令时也是它） |
 | `filebot check [选项]` | 只做连接自检后退出 |
-| `filebot once [选项]` | 把目录里现有文件发一遍后退出（补发历史文件用） |
+| `filebot once [选项]` | 把目录里现有文件发一遍后退出（补发历史文件用）；有文件没发成功时退出码非 0 |
 | `filebot install-service` | 生成并安装 systemd 服务（Debian 12/13） |
 | `filebot uninstall-service` | 停止并移除服务（`--purge` 连配置/状态/用户一起删） |
 | `filebot version` / `help` | 版本 / 帮助 |
@@ -152,7 +152,8 @@ Bot API 没有客户端那种"压缩开关"。这里用的是 Telegram 的**媒�
 - **自动忽略**：隐藏文件/目录、`*.part/*.tmp/*.crdownload` 等临时文件、小于 `min_size` 的。
 - **失败不阻塞**：网络类错误退避重试；429 按 `retry_after` 退避；400/403 只记日志不重试；
   单个文件出错不影响后续文件。
-- **退出时会把手头的队列发完**（`SIGINT`/`SIGTERM` 都行），不会把已发现的文件丢掉。
+- **退出时会发完手头的队列**（`SIGINT`/`SIGTERM` 都行），并且会多等一段（最多 `settle_seconds`，
+  上限 10 秒）把"刚落地、还在去抖窗口里"的文件也发出去；确实来不及的会在日志里列出文件名。
 - **多个接收方**：同一文件按 `chat_id` 顺序逐个发送，每个接收方内部都是"原文件 → 可点开的
   版本"挨着发；转码只做一次、多个接收方复用同一份副本。某个接收方失败（比如机器人不在那个
   频道里）不影响其它接收方，日志里会明确指出是哪个 chat 失败。
@@ -164,8 +165,10 @@ Bot API 没有客户端那种"压缩开关"。这里用的是 Telegram 的**媒�
 1. 检查 root 权限、`systemctl` 是否存在、是否 Debian 系（非 Debian 只警告）；
 2. 解析二进制路径（当前可执行文件，跟随符号链接）、配置路径（默认 `/etc/filebot/config.toml`）、
    状态目录（默认 `/var/lib/filebot`）；
-3. 配置不存在时写一份模板（权限 0600）并**跳过启动** —— 否则没有 token 会崩溃重启刷日志；
-4. 需要时创建系统用户（`useradd --system --shell /usr/sbin/nologin filebot`）；
+3. 配置不存在时写一份模板（权限 0600）；配置不存在**或还没填好**（缺 token/chat_id/目录）时
+   都**跳过 enable/start** —— 否则只会拉起一个启动即退出的服务，被 `Restart=always` 反复重启刷日志；
+4. 需要时创建系统用户（`useradd --system --shell /usr/sbin/nologin filebot`），并把配置文件
+   `chown` 给该用户（默认 0600 + root 属主时服务读不到 token，会一直重启）；
 5. 渲染单元文件 → 用 `systemd-analyze verify` 校验 → 写入
    `/etc/systemd/system/filebot.service`；
 6. `systemctl daemon-reload` → `enable` → `restart`。
@@ -196,21 +199,24 @@ PrivateTmp=true
 有用选项：`--user root`（不建新用户）、`--no-start` / `--no-enable`、`--config`、`--bin`、
 `--name`、`--force`、`--dry-run`、`--root DIR`（离线镜像：所有路径加前缀，且默认不碰 systemd）。
 
-卸载：`sudo filebot uninstall-service`（加 `--purge` 连配置、状态目录、系统用户一起删）。
+卸载：`sudo filebot uninstall-service`（加 `--purge` 连配置、状态文件、系统用户一起清）。
+`--purge` 只会删 filebot 自己建的目录；你用 `-c` / `--state-dir` 指向别处的路径**不会被整目录删**，
+只删其中的配置文件与状态文件。
 
 ## 构建与测试
 
 ```bash
-make linux-amd64      # → dist/filebot-2.0.0-linux-amd64（CGO_ENABLED=0，静态）
+make linux-amd64      # → dist/filebot-<版本>-linux-amd64（CGO_ENABLED=0，静态）
 make build            # 本机架构
 make test             # go test ./...
 make vet
 ```
 
-测试覆盖：配置优先级与未知键报错、目录去抖与过滤、媒体分类与（桩程序）转码路径、
-multipart 字节与重试/限流、**socks5 与 http 代理链路**（假代理服务端）、Bot API 端到端
-（假服务端 + 状态去重 + 常驻模式 + 多接收方）、systemd 单元渲染与安装流程（假 systemctl +
-临时 root + 真实 `systemd-analyze verify`），最后编译**真实二进制**跑
+`go test ./...` 共 **153** 个用例，全部通过。覆盖：配置优先级与未知键报错、目录去抖与过滤（含符号链接目录/文件）、媒体分类与
+（桩程序）转码路径与产物大小校验、multipart 字节与重试/限流/重定向/凭据脱敏、
+**socks5 与 http 代理链路**（假代理服务端）、Bot API 端到端（假服务端 + 状态去重 +
+常驻模式 + 多接收方 + 启动自检窗口 + 退出补发）、systemd 单元渲染与安装/卸载流程
+（假 systemctl + 临时 root + 真实 `systemd-analyze verify`），最后编译**真实二进制**跑
 `once` / `check` / `run`(SIGINT) / `install-service`。
 
 假 Telegram 服务端刻意与真实 API 保持一致的"脾气"（比如同样拒绝没有任何 part 的
@@ -252,6 +258,9 @@ docs/superpowers/specs/    设计文档
   并把 `max_upload_mb` 调大。
 - 视频能否"点开即播"取决于 Telegram 对容器的支持：mp4/webm 最稳，其它容器靠 ffmpeg 转码。
 - 只比较 mtime + size，文件改名会被当成新文件发送。
+- 多接收方时，只要有**任意一个**接收方成功收到，这个文件版本就记为"已发送"：如果某个频道当时
+  失败（例如机器人权限不对）且文件之后不再变化，那个频道不会再收到这个版本（`once` 也会跳过它）。
+  单接收方不受影响。
 - 多接收方时每个文件要发 2×N 条消息，配合默认 1 秒节流会比单接收方慢 N 倍；接收方很多时
   可以把 `min_send_interval` 调小，或分多个进程跑。
 - 单进程轮询；几万个文件的目录建议缩小监控范围或调大 `poll_interval`。

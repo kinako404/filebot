@@ -98,9 +98,18 @@ func New(opt Options) (*Client, error) {
 		transport = http.DefaultTransport
 	}
 	return &Client{
-		token:      opt.Token,
-		baseURL:    base,
-		http:       &http.Client{Transport: transport, Timeout: timeout},
+		token:   opt.Token,
+		baseURL: base,
+		http: &http.Client{
+			Transport: transport,
+			Timeout:   timeout,
+			// 不跟随重定向：301/302/303 会被 Go 改成没有 body 的 GET，
+			// 上传就被静默丢掉了（api_base 被反代/镜像跳转时很容易踩到）。
+			// 让 3xx 作为最终响应返回，交给 once 报成明确的错误。
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		maxRetries: retries,
 		minGap:     opt.MinSendInterval,
 	}, nil
@@ -111,21 +120,23 @@ func New(opt Options) (*Client, error) {
 // 没有任何字段/文件的方法（比如 getMe）会发一个空 body 的 POST：
 // 真实 Telegram 会拒绝"零部件 multipart"（400 + 空 body）。
 func (c *Client) Call(ctx context.Context, method string, fields map[string]string, file *FilePart) (json.RawMessage, error) {
-	var body *multipartBody
-	if len(fields) > 0 || file != nil {
-		var err error
-		body, err = newMultipartBody(fields, file)
-		if err != nil {
-			return nil, err
-		}
-	}
 	url := fmt.Sprintf("%s/bot%s/%s", c.baseURL, c.token, method)
 
 	var lastErr error
 	for attempt := 1; attempt <= c.maxRetries; attempt++ {
 		c.throttle(ctx)
-		if body != nil {
-			body.Reset()
+		// 每次尝试都重新构造请求体：重新 os.Stat 一次拿到当前长度，
+		// 保证 Content-Length 与实际读出去的字节数一致（文件在请求期间
+		// 变大/变小会让 net/http 报 ContentLength=X with Body length Y，
+		// 甚至先写出半截 multipart）。顺带也躲开了"上一轮的 transport
+		// 还在后台读 body，这里却 Reset 复用同一个对象"的共享可变状态。
+		var body *multipartBody
+		if len(fields) > 0 || file != nil {
+			var err error
+			body, err = newMultipartBody(fields, file)
+			if err != nil {
+				return nil, err
+			}
 		}
 		result, err := c.once(ctx, url, method, body)
 		if err == nil {
@@ -162,7 +173,8 @@ func (c *Client) once(ctx context.Context, url, method string, body *multipartBo
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, reader)
 	if err != nil {
-		return nil, err
+		// 这里的报错也带请求 URL（含 token），先脱敏再往外抛
+		return nil, c.redactError(err)
 	}
 	if body != nil {
 		req.ContentLength = body.Len()
@@ -172,12 +184,24 @@ func (c *Client) once(ctx context.Context, url, method string, body *multipartBo
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, &retryableError{err: err}
+		// Do 的错误里带完整 URL（含 token），journal 是持久化的，必须脱敏
+		return nil, &retryableError{err: c.redactError(err)}
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, &retryableError{err: err}
+		return nil, &retryableError{err: c.redactError(err)}
+	}
+
+	// 3xx 一律当错误：http.Client 不跟随重定向（见 New 里的 CheckRedirect），
+	// 否则 POST 会被降级成没有 body 的 GET，文件根本没上传，报错却指向别处。
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		location := c.redactText(resp.Header.Get("Location"))
+		description := "收到重定向响应（请检查 api_base：重定向会让上传变成没有 body 的 GET）"
+		if location != "" {
+			description = fmt.Sprintf("被重定向到 %s（请检查 api_base：重定向会让上传变成没有 body 的 GET）", location)
+		}
+		return nil, &APIError{Method: method, Code: resp.StatusCode, Description: description}
 	}
 
 	var payload struct {
@@ -190,15 +214,18 @@ func (c *Client) once(ctx context.Context, url, method string, body *multipartBo
 		} `json:"parameters"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		preview := describeBody(raw)
-		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			// 4xx 重试没有意义（比如请求体被拒），直接把状态码摊开给用户看
+		// 响应体里也可能被反代塞进请求 URL，顺手一起脱敏
+		preview := c.redactText(describeBody(raw))
+		if !retryableStatus(resp.StatusCode) {
+			// 重试没有意义的 4xx（比如请求体被拒），直接把状态码摊开给用户看
 			return nil, &APIError{
 				Method:      method,
 				Code:        resp.StatusCode,
 				Description: fmt.Sprintf("响应不是 JSON：%s", preview),
 			}
 		}
+		// 状态码本身值得重试：429/408/425 和所有 5xx 即便 body 不是 JSON
+		// （接入层/CDN 的限流页就是 HTML）也照样退避重试。
 		return nil, &retryableError{
 			err: fmt.Errorf("响应不是 JSON（HTTP %d）：%s", resp.StatusCode, preview),
 		}
@@ -221,6 +248,45 @@ func (c *Client) once(ctx context.Context, url, method string, body *multipartBo
 	}
 	return payload.Result, nil
 }
+
+// retryableStatus 判断状态码本身是否值得重试（与 JSON 分支保持一致）：
+// 429 限流、408 请求超时、425 too early，以及所有 5xx。
+func retryableStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests, http.StatusRequestTimeout, http.StatusTooEarly:
+		return true
+	}
+	return code >= 500
+}
+
+// redactText 把文本里可能出现的 Bot token 换成占位符。
+// token 会出现在请求 URL 中，而错误信息与反代回显都可能带上它。
+func (c *Client) redactText(text string) string {
+	if c.token == "" {
+		return text
+	}
+	return strings.ReplaceAll(text, c.token, "<token>")
+}
+
+// redactError 给错误文本脱敏。只改 Error() 的输出，Unwrap 链保持原样，
+// 所以 *APIError / 可重试错误的分类判定不受影响。
+func (c *Client) redactError(err error) error {
+	if err == nil || c.token == "" || !strings.Contains(err.Error(), c.token) {
+		return err
+	}
+	return &redactedError{err: err, token: c.token}
+}
+
+type redactedError struct {
+	err   error
+	token string
+}
+
+func (e *redactedError) Error() string {
+	return strings.ReplaceAll(e.err.Error(), e.token, "<token>")
+}
+
+func (e *redactedError) Unwrap() error { return e.err }
 
 func (c *Client) throttle(ctx context.Context) {
 	if c.minGap <= 0 {

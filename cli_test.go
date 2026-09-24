@@ -324,12 +324,11 @@ func TestBadProxySchemeIsRejected(t *testing.T) {
 
 func TestDaemonModeAndSigterm(t *testing.T) {
 	e := newEnv(t)
-	e.write("photo.jpg", 2048)
 
 	cmd := exec.Command(e.bin, "run", "-c", e.configFile(""),
 		"--poll-interval", "0.2", "--settle-seconds", "0.2")
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	logs := &syncBuffer{}
+	cmd.Stderr = logs
 	cmd.Env = cleanEnv()
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -341,12 +340,27 @@ func TestDaemonModeAndSigterm(t *testing.T) {
 		}
 	}()
 
+	// 常驻模式只发运行中新增的文件：先等它自检完并拍完基准快照，再放文件进去
 	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) && len(e.fake.Calls()) == 0 {
+	for time.Now().Before(deadline) && len(e.fake.CallsOf("getMe")) == 0 {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if len(e.fake.CallsOf("getMe")) == 0 {
+		t.Fatalf("常驻进程没有完成自检\n%s", logs.String())
+	}
+	time.Sleep(500 * time.Millisecond)
+	e.write("photo.jpg", 2048)
+
+	deadline = time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) && (len(e.fake.CallsOf("sendDocument")) == 0 || len(e.fake.CallsOf("sendPhoto")) == 0) {
 		time.Sleep(200 * time.Millisecond)
 	}
-	if len(e.fake.Calls()) == 0 {
-		t.Fatalf("常驻模式没有发送文件\n%s", stderr.String())
+	// 断言真正关心的事：运行中新增的文件被发出去了（不能只数 getMe）
+	if len(e.fake.CallsOf("sendDocument")) == 0 {
+		t.Fatalf("常驻模式没有发送运行中新增的文件\n%s", logs.String())
+	}
+	if len(e.fake.CallsOf("sendPhoto")) == 0 {
+		t.Fatalf("可点开的版本没有发送\n%s", logs.String())
 	}
 
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
@@ -357,13 +371,13 @@ func TestDaemonModeAndSigterm(t *testing.T) {
 	select {
 	case err := <-waitErr:
 		if err != nil {
-			t.Fatalf("SIGINT 之后应当正常退出：%v\n%s", err, stderr.String())
+			t.Fatalf("SIGINT 之后应当正常退出：%v\n%s", err, logs.String())
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("SIGINT 之后没有退出")
 	}
-	if !strings.Contains(stderr.String(), "已退出") {
-		t.Fatalf("stderr = %s", stderr.String())
+	if !strings.Contains(logs.String(), "已退出") {
+		t.Fatalf("logs = %s", logs.String())
 	}
 }
 
@@ -459,6 +473,8 @@ func TestDaemonIgnoresScanExistingFromConfig(t *testing.T) {
 	if !strings.Contains(logs.String(), "已忽略 watch.scan_existing") {
 		t.Fatalf("应当提示忽略了 scan_existing：\n%s", logs.String())
 	}
+	// 这条日志打在基准快照之前，必须等快照拍完再放文件，否则它会被当成"启动前就存在"
+	time.Sleep(500 * time.Millisecond)
 
 	e.write("new.jpg", 2048)
 	deadline = time.Now().Add(20 * time.Second)

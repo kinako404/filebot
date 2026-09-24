@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // FilePart 是收到的上传文件。
@@ -53,6 +54,7 @@ type FakeTelegram struct {
 	script       []Scripted
 	methodScript map[string][]Scripted
 	onCall       func(Call)
+	slowMethod   map[string]time.Duration
 }
 
 // NewFakeTelegram 启动假服务端。
@@ -67,6 +69,16 @@ func (f *FakeTelegram) URL() string { return f.server.URL }
 
 // Close 关闭服务端。
 func (f *FakeTelegram) Close() { f.server.Close() }
+
+// DelayMethod 让某个方法的响应先等一会儿（模拟慢网络/慢自检）。
+func (f *FakeTelegram) DelayMethod(method string, delay time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.slowMethod == nil {
+		f.slowMethod = map[string]time.Duration{}
+	}
+	f.slowMethod[method] = delay
+}
 
 // ScriptNext 预置下一条响应（先到先用）。
 func (f *FakeTelegram) ScriptNext(status int, payload map[string]any) {
@@ -152,7 +164,12 @@ func (f *FakeTelegram) handle(w http.ResponseWriter, r *http.Request) {
 	f.calls = append(f.calls, call)
 	scripted := f.takeScript(method)
 	callback := f.onCall
+	delay := f.slowMethod[method]
 	f.mu.Unlock()
+
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 
 	if callback != nil {
 		callback(call)
@@ -482,10 +499,23 @@ func (f *FakeHTTPProxy) handle(conn net.Conn) {
 	method, requestTarget := parts[0], parts[1]
 
 	if strings.EqualFold(method, "CONNECT") {
+		// 必须先读完整个请求头（到空行）再建隧道：否则请求头如果分多个 TCP 段到达，
+		// 后面那半截会被当成隧道数据转发给目标（真实代理不会这么做）
+		drainHeader(reader)
 		f.tunnel(conn, requestTarget)
 		return
 	}
 	f.forward(conn, reader, method, requestTarget, parts[2])
+}
+
+// drainHeader 读掉请求头剩余部分，直到空行。
+func drainHeader(reader *bufio.Reader) {
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil || strings.TrimSpace(line) == "" {
+			return
+		}
+	}
 }
 
 // tunnel 处理 CONNECT（HTTPS 走这条）。

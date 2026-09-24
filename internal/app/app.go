@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"filebot/internal/config"
@@ -22,7 +23,10 @@ import (
 const (
 	sendAttempts = 2
 	retryDelay   = 5 * time.Second
-	stopGrace    = 60 * time.Second
+	// stopGrace 是常驻模式退出时等待在途发送的上限
+	stopGrace = 60 * time.Second
+	// maxDrainGrace 是退出前为"还在去抖窗口里"的文件额外等待的上限
+	maxDrainGrace = 10 * time.Second
 )
 
 // App 是一次文件转发任务的运行时。
@@ -35,6 +39,8 @@ type App struct {
 
 	queue   chan watch.File
 	workers sync.WaitGroup
+	// failed 统计"一条消息都没发出去"的文件数，供 once 判断退出码
+	failed atomic.Int64
 }
 
 // New 构造 App（含代理、客户端、转换工具与状态文件）。
@@ -131,7 +137,12 @@ func (a *App) RunOnce(ctx context.Context) error {
 		a.queue <- file
 	}
 	close(a.queue)
-	a.waitWorkers(stopGrace)
+	// 补发不设硬上限：这是"把目录里现有文件发一遍"的一次性任务，
+	// 到点就返回会让脚本以为成功了、实际只发了一部分
+	a.workers.Wait()
+	if failed := a.failed.Load(); failed > 0 {
+		return fmt.Errorf("有 %d 个文件没能发送成功，请查看日志；可重新执行一次补发", failed)
+	}
 	return nil
 }
 
@@ -140,6 +151,13 @@ func (a *App) RunOnce(ctx context.Context) error {
 // 只处理启动之后新出现或发生变化（含正在拷贝、写完后才稳定的）文件：
 // 启动时就存在且没有再变化的文件一律不管。
 func (a *App) Run(ctx context.Context) error {
+	watchCfg := a.cfg.Watch
+	watchCfg.ScanExisting = false
+	watcher := watch.New(watchCfg)
+	// 先拍基准快照，再去做网络自检：否则自检（含重试，可能几十秒）期间
+	// 落进目录的文件会被当成"启动前就存在"，之后永远发不出去
+	watcher.Poll(time.Now())
+
 	if err := a.Check(ctx); err != nil {
 		return err
 	}
@@ -151,34 +169,71 @@ func (a *App) Run(ctx context.Context) error {
 	defer cancel()
 	a.startWorkers(workerCtx, a.cfg.Workers)
 
-	watchCfg := a.cfg.Watch
-	watchCfg.ScanExisting = false
-	watcher := watch.New(watchCfg)
-	watcher.Run(ctx, func(files []watch.File) {
-		fresh := make([]watch.File, 0, len(files))
-		for _, file := range files {
-			if !a.relevant(file) {
-				continue
-			}
-			fresh = append(fresh, file)
-		}
-		if len(fresh) == 0 {
-			return
-		}
-		a.log.Info("发现新文件", "count", len(fresh))
-		for _, file := range fresh {
-			select {
-			case a.queue <- file:
-			case <-ctx.Done():
-				return
-			}
-		}
-	})
+	watcher.Run(ctx, func(files []watch.File) { a.enqueue(files, ctx) })
 
+	// 退出前再给"刚落地、还在去抖窗口里"的文件一点时间，
+	// 否则它们会留在目录里再也发不出去（下次启动已算"启动前就存在"）
+	a.drainPending(watcher)
 	close(a.queue)
 	a.waitWorkers(stopGrace)
 	a.log.Info("已退出")
 	return nil
+}
+
+// enqueue 过滤并投递文件，返回实际入队数量。ctx 为 nil 表示不响应取消。
+func (a *App) enqueue(files []watch.File, ctx context.Context) int {
+	fresh := make([]watch.File, 0, len(files))
+	for _, file := range files {
+		if !a.relevant(file) {
+			continue
+		}
+		fresh = append(fresh, file)
+	}
+	if len(fresh) == 0 {
+		return 0
+	}
+	a.log.Info("发现新文件", "count", len(fresh))
+	queued := 0
+	for _, file := range fresh {
+		if ctx == nil {
+			a.queue <- file
+			queued++
+			continue
+		}
+		select {
+		case a.queue <- file:
+			queued++
+		case <-ctx.Done():
+			return queued
+		}
+	}
+	return queued
+}
+
+// drainPending 在退出前等一小段时间，把去抖窗口里的文件也发出去。
+func (a *App) drainPending(w *watch.Watcher) {
+	grace := a.cfg.Watch.SettleSeconds
+	if grace <= 0 {
+		grace = 0.1
+	}
+	if grace > maxDrainGrace.Seconds() {
+		grace = maxDrainGrace.Seconds()
+	}
+	deadline := time.Now().Add(time.Duration(grace * float64(time.Second)))
+	queued := 0
+	for {
+		queued += a.enqueue(w.Poll(time.Now()), nil)
+		if len(w.Pending()) == 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if queued > 0 {
+		a.log.Info("退出前补发去抖中的文件", "count", queued)
+	}
+	if left := w.Pending(); len(left) > 0 {
+		a.log.Warn("以下文件退出前仍未稳定，本次不发送；需要补发请运行 `filebot once`", "files", left)
+	}
 }
 
 func (a *App) startWorkers(ctx context.Context, count int) {
@@ -211,13 +266,16 @@ func (a *App) waitWorkers(grace time.Duration) {
 
 func (a *App) process(ctx context.Context, file watch.File) {
 	done := map[string]bool{}
+	delivered := 0
 	for attempt := 1; attempt <= sendAttempts; attempt++ {
-		err := a.handle(ctx, file, done)
+		sent, err := a.handle(ctx, file, done)
+		delivered += sent
 		if err == nil {
 			break
 		}
-		var apiErr *tg.APIError
-		if errors.As(err, &apiErr) {
+		// 只有当所有失败都是"Bot API 明确拒绝"时才不再重试；
+		// 混着网络类错误就还有救，值得再试一次
+		if permanentOnly(err) {
 			a.log.Error("发送失败（Bot API 拒绝，不再重试）",
 				"path", file.Path, "err", err)
 			break
@@ -230,38 +288,64 @@ func (a *App) process(ctx context.Context, file watch.File) {
 			}
 		}
 	}
-	// 只要有一个接收方拿到了，就记为已发送，避免之后文件变化时重复轰炸
-	if len(done) > 0 {
-		a.store.Mark(file.Path, file.MTime, file.Size)
-		if err := a.store.Save(); err != nil {
-			a.log.Warn("保存状态文件失败", "err", err)
-		}
+	if delivered == 0 {
+		// 一条消息都没发出去（比如同时关了原文件、又没有可用的转换工具），
+		// 绝不能记成"已发送"，否则这个文件以后永远不会再尝试
+		a.failed.Add(1)
+		a.log.Error("文件没有任何内容发送成功，不记为已发送", "path", file.Path)
 		return
 	}
-	a.log.Error("文件未能发送，稍后如有变化会重试", "path", file.Path)
+	// 至少有一个接收方拿到了，记为已发送，避免之后文件变化时重复轰炸
+	a.store.Mark(file.Path, file.MTime, file.Size)
+	if err := a.store.Save(); err != nil {
+		a.log.Warn("保存状态文件失败", "err", err)
+	}
 }
 
-// handle 把文件发给所有接收方。done 记录已经成功的 (接收方, 内容) 组合，重试时不会重复发送。
-func (a *App) handle(ctx context.Context, file watch.File, done map[string]bool) error {
+// permanentOnly 判断错误树里是否全部都是不可重试的 Bot API 业务错误。
+func permanentOnly(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		items := joined.Unwrap()
+		if len(items) == 0 {
+			return false
+		}
+		for _, item := range items {
+			if !permanentOnly(item) {
+				return false
+			}
+		}
+		return true
+	}
+	var apiErr *tg.APIError
+	return errors.As(err, &apiErr)
+}
+
+// handle 把文件发给所有接收方，返回实际成功发出的消息条数。
+// done 记录已经成功的 (接收方, 内容) 组合，重试时不会重复发送。
+func (a *App) handle(ctx context.Context, file watch.File, done map[string]bool) (int, error) {
 	kind := media.Classify(file.Path)
 	if kind == "" {
 		a.log.Debug("不是图片/视频，忽略", "path", file.Path)
-		return nil
+		return 0, nil
 	}
 	upload := a.cfg.Upload
 	caption := RenderCaption(upload.CaptionTemplate, file.Path, file.Size, string(kind))
 
 	// 转码/抓取只做一次，多个接收方复用同一份副本
 	var prepared *media.Prepared
-	var preparerErr error
 	if upload.SendCompressed {
+		var preparerErr error
 		prepared, preparerErr = a.preparer.Prepare(file.Path, kind)
 		if prepared != nil {
 			defer prepared.Cleanup()
 		}
 		switch {
 		case errors.Is(preparerErr, media.ErrNoConverter):
-			a.log.Info("无法生成可点开的副本（缺少转换工具或超出上限），只发原文件", "path", file.Path)
+			a.log.Info("无法生成可点开的副本（缺少转换工具或超出上限）",
+				"path", file.Path, "send_original", upload.SendOriginal)
 			preparerErr = nil
 		case preparerErr != nil:
 			a.log.Warn("生成可点开的副本失败", "path", file.Path, "err", preparerErr)
@@ -269,12 +353,8 @@ func (a *App) handle(ctx context.Context, file watch.File, done map[string]bool)
 		}
 	}
 
-	var firstErr error
-	fail := func(err error) {
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
+	delivered := 0
+	var failures []error
 
 	for _, chat := range a.cfg.Telegram.ChatIDs {
 		if upload.SendOriginal {
@@ -283,9 +363,10 @@ func (a *App) handle(ctx context.Context, file watch.File, done map[string]bool)
 				if file.Size <= a.cfg.MaxUploadBytes() {
 					if err := a.client.SendDocument(ctx, chat, file.Path, caption); err != nil {
 						a.log.Error("发送原文件失败", "chat", chat, "path", file.Path, "err", err)
-						fail(err)
+						failures = append(failures, err)
 					} else {
 						done[key] = true
+						delivered++
 						a.log.Info("已发送原文件", "chat", chat, "path", file.Path,
 							"size", HumanSize(file.Size))
 					}
@@ -330,14 +411,15 @@ func (a *App) handle(ctx context.Context, file watch.File, done map[string]bool)
 		}
 		if sendErr != nil {
 			a.log.Error("发送可点开的版本失败", "chat", chat, "path", file.Path, "err", sendErr)
-			fail(sendErr)
+			failures = append(failures, sendErr)
 			continue
 		}
 		done[key] = true
+		delivered++
 		a.log.Info("已发送可点开的版本", "chat", chat, "path", file.Path,
 			"kind", prepared.Kind, "note", prepared.Note)
 	}
-	return firstErr
+	return delivered, errors.Join(failures...)
 }
 
 // relevant 判断文件是否值得发送：是图片/视频，且这个版本还没发过。

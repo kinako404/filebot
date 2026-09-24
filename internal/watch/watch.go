@@ -9,11 +9,15 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"filebot/internal/config"
 )
+
+// minPollInterval 是轮询间隔的下限（0/负值会变成忙循环）。
+const minPollInterval = 100 * time.Millisecond
 
 var tempSuffixes = []string{
 	".part", ".tmp", ".crdownload", ".download", ".partial", ".filepart", ".swp",
@@ -51,10 +55,20 @@ type Watcher struct {
 
 // New 按配置创建 watcher。
 func New(cfg config.Watch) *Watcher {
+	// poll_interval 必须钳到合理下限：0/负值会让 timer.Reset 立刻到期，
+	// 变成"全速递归扫盘"的忙循环
+	poll := time.Duration(cfg.PollInterval * float64(time.Second))
+	if poll < minPollInterval {
+		poll = minPollInterval
+	}
+	settle := time.Duration(cfg.SettleSeconds * float64(time.Second))
+	if settle < 0 {
+		settle = 0
+	}
 	return &Watcher{
 		dirs:         cfg.Dirs,
-		pollInterval: time.Duration(cfg.PollInterval * float64(time.Second)),
-		settle:       time.Duration(cfg.SettleSeconds * float64(time.Second)),
+		pollInterval: poll,
+		settle:       settle,
 		minSize:      cfg.MinSize,
 		excludes:     cfg.Exclude,
 		scanExisting: cfg.ScanExisting,
@@ -66,6 +80,11 @@ func New(cfg config.Watch) *Watcher {
 func (w *Watcher) Snapshot() map[string]signature {
 	found := map[string]signature{}
 	for _, root := range w.dirs {
+		// /media -> /mnt/disk/media 这类符号链接目录很常见；WalkDir 用 Lstat 看根条目，
+		// 不解析的话会把整个目录当成"非目录"直接跳过（静默监控不到任何东西）
+		if resolved, err := filepath.EvalSymlinks(root); err == nil {
+			root = resolved
+		}
 		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				if d != nil && d.IsDir() {
@@ -80,15 +99,17 @@ func (w *Watcher) Snapshot() map[string]signature {
 				}
 				return nil
 			}
-			if !d.Type().IsRegular() || shouldSkip(name) {
-				return nil
-			}
-			if w.matchesExclude(path, name) {
+			if shouldSkip(name) || w.matchesExclude(path, name) {
 				return nil
 			}
 			info, err := d.Info()
-			if err != nil {
-				return nil
+			if err != nil || !info.Mode().IsRegular() {
+				// 可能是符号链接/dev/fifo：跟随一次，指向普通文件才算数（与 Python 版一致）
+				target, statErr := os.Stat(path)
+				if statErr != nil || !target.Mode().IsRegular() {
+					return nil
+				}
+				info = target
 			}
 			found[path] = signature{mtime: info.ModTime().UnixNano(), size: info.Size()}
 			return nil
@@ -133,6 +154,16 @@ func (w *Watcher) Poll(now time.Time) []File {
 		ready = append(ready, File{Path: path, MTime: sig.mtime, Size: sig.size})
 	}
 	return ready
+}
+
+// Pending 返回还在去抖窗口里、尚未产出的文件路径。
+func (w *Watcher) Pending() []string {
+	paths := make([]string, 0, len(w.pending))
+	for path := range w.pending {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 // Run 持续轮询直到 ctx 结束。

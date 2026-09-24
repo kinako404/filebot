@@ -473,3 +473,108 @@ func waitFor(t *testing.T, timeout time.Duration, condition func() bool, message
 	}
 	t.Fatal(message)
 }
+
+// 启动自检（getMe）期间落进目录的文件也属于"运行中新增"，必须发送。
+// 回归：基准快照曾经在自检之后才拍，这段窗口里的文件会被当成"启动前就存在"而永远丢失。
+func TestFilesArrivingDuringStartupCheckAreSent(t *testing.T) {
+	e := newEnv(t)
+	e.fake.DelayMethod("getMe", 1500*time.Millisecond)
+
+	cfg := e.config(func(c *config.Config) {
+		c.Watch.PollInterval = 0.05
+		c.Watch.SettleSeconds = 0.05
+		c.Telegram.MinSendInterval = 0
+	})
+	runtime, err := New(cfg, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+		}
+	}()
+
+	// 自检还没返回时就把文件放进去（这正是之前会被丢掉的那类文件）
+	time.Sleep(200 * time.Millisecond)
+	e.write("during-check.jpg", 3000)
+
+	waitFor(t, 20*time.Second, func() bool {
+		return count(e.fake.Methods(), "sendPhoto") >= 1
+	}, "启动自检期间新增的文件被丢掉了")
+}
+
+// 退出时不能把"刚落地、还在去抖窗口里"的文件丢掉
+func TestShutdownFlushesPendingFiles(t *testing.T) {
+	e := newEnv(t)
+	cfg := e.config(func(c *config.Config) {
+		c.Watch.PollInterval = 0.05
+		c.Watch.SettleSeconds = 1.0 // 故意让去抖窗口比写入时刻长
+		c.Telegram.MinSendInterval = 0
+	})
+	runtime, err := New(cfg, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(ctx) }()
+
+	waitFor(t, 15*time.Second, func() bool {
+		return len(e.fake.CallsOf("getMe")) > 0
+	}, "Run 没有完成自检")
+	time.Sleep(200 * time.Millisecond) // 等基准快照拍完
+
+	e.write("late.jpg", 2048)
+	time.Sleep(200 * time.Millisecond) // 远小于 settle，文件仍在去抖窗口里
+	cancel()                           // 此刻退出
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run 返回错误：%v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run 没有退出")
+	}
+	if count(e.fake.Methods(), "sendDocument") == 0 {
+		t.Fatal("退出时去抖窗口里的文件被静默丢掉了")
+	}
+}
+
+// 一条消息都没发出去时绝不能记成"已发送"，否则这个文件以后永远不会再尝试
+func TestNothingDeliveredIsNotMarkedAsSent(t *testing.T) {
+	e := newEnv(t)
+	// 关掉原文件 + 用一个无法转换的图片（内容是垃圾字节，ffmpeg/imagemagick 都解不开）
+	path := e.write("broken.bmp", 2048)
+	if err := os.WriteFile(path, []byte("not a real image at all"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := e.config(func(c *config.Config) { c.Upload.SendOriginal = false })
+
+	runtime, err := New(cfg, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	err = runtime.RunOnce(context.Background())
+	if err == nil {
+		t.Fatal("一个文件都没发出去，RunOnce 应当返回错误（让脚本/运维能发现）")
+	}
+	if len(e.fake.Calls()) != 0 {
+		t.Fatalf("不该有任何调用：%v", e.fake.Methods())
+	}
+	if raw, readErr := os.ReadFile(e.state); readErr == nil && strings.Contains(string(raw), "broken.bmp") {
+		t.Fatalf("没发出去的文件不该被记进状态文件：%s", raw)
+	}
+}
