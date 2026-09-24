@@ -1,7 +1,12 @@
-# filebot — 监控目录，把新增的图片/视频发到 Telegram
+# filebot — Python 版（已归档）
+
+> **这是上一版实现，已由仓库根目录的 Go 版取代，仅作备查保留。**
+> 现行版本请看 [根目录 README](../README.md)；Go 版功能等价，部署只需一个静态二进制，
+> 并且代理只支持 socks5/http（不再内置 Shadowsocks 客户端）。
+> 下面内容描述的是当时的 Python 版本，不再更新。
 
 监控一个（或多个）Linux 目录（含所有子目录）。当里面出现新的或更新过的**图片/视频**时，
-推送到 Telegram：
+转发到 Telegram：
 
 1. **原文件**：走 `sendDocument`，不压缩、不转码，点击后当文件下载；
 2. **可直接点开的版本**：图片 `sendPhoto`、动图 `sendAnimation`、视频 `sendVideo`

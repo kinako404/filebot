@@ -1,4 +1,4 @@
-# filebot — 监控目录，把新增的图片/视频发到 Telegram
+# filebot — 监控目录，把新增/更新的图片/视频转发到 Telegram
 
 一个静态编译的 Go 二进制，拷到机器上就能跑，无需解释器、无需第三方运行时。
 
@@ -13,7 +13,7 @@
 
 ```bash
 # 1. 拿二进制（或自己编译：make linux-amd64）
-sudo install -m 0755 dist/filebot-2.0.0-linux-amd64 /usr/local/bin/filebot
+sudo install -m 0755 dist/filebot-<版本>-linux-amd64 /usr/local/bin/filebot
 
 # 2. 先干跑看一眼它会做什么（不写任何文件）
 sudo filebot install-service --dry-run

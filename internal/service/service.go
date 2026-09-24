@@ -253,7 +253,7 @@ func Install(opts Options) error {
 	}
 
 	unitParams := Params{
-		Description: "filebot - 监控目录并把图片/视频发送到 Telegram",
+		Description: "filebot - 监控目录，把新增/更新的图片/视频转发到 Telegram",
 		User:        opts.User,
 		BinPath:     p.bin,
 		ConfigPath:  p.config,

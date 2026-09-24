@@ -21,7 +21,7 @@ import (
 // Version 是构建版本号，构建时可用 -ldflags 覆盖。
 var Version = "2.1.2"
 
-const usage = `filebot - 监控目录，把新增/更新的图片、视频发送到 Telegram
+const usage = `filebot - 监控目录，把新增/更新的图片/视频转发到 Telegram
 
 用法：
   filebot [run] [选项]              常驻监控（默认命令）

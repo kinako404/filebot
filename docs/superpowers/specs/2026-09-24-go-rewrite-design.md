@@ -12,7 +12,7 @@ Python 版运行时依赖解释器，部署要带源码 + 解释器。Go 版编�
 
 ## 2. 目标（与 Python 版保持一致的对外行为）
 
-监控一个或多个目录（递归），图片/视频新增或更新时推送到 Telegram：
+监控一个或多个目录（递归），图片/视频新增或变化时转发到 Telegram：
 
 1. 原文件 → `sendDocument`（不压缩、不转码）
 2. 可点开的版本 → `sendPhoto` / `sendAnimation` / `sendVideo(supports_streaming)`

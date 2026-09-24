@@ -1,4 +1,4 @@
-// filebot 监控目录，把新增/更新的图片与视频发送到 Telegram。
+// filebot 监控目录，把新增/更新的图片/视频转发到 Telegram。
 package main
 
 import (
