@@ -1,0 +1,22 @@
+# 构建产物（用 make linux-amd64 现编，或从 Release 下载）
+/dist/
+/filebot
+*.test
+
+# 本地配置与运行状态：可能含真实 token / chat_id，绝不入库
+config.toml
+state.json
+*.state.json
+
+# Go
+*.exe
+
+# Python（legacy-python 用）
+__pycache__/
+*.py[cod]
+
+# 编辑器 / 系统杂物
+.idea/
+.vscode/
+*.swp
+.DS_Store

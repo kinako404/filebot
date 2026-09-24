@@ -1,0 +1,70 @@
+# filebot 配置示例（手工运行用）
+#
+#   cp config.example.toml config.toml
+#   vim config.toml
+#   ./filebot check -c config.toml     # 自检
+#   ./filebot run   -c config.toml     # 正式运行
+#
+# 也可以不写配置文件，用环境变量或命令行参数：
+#   FILEBOT_TG_TOKEN / FILEBOT_TG_CHAT_ID / FILEBOT_PROXY / FILEBOT_WATCH_DIRS
+# 优先级：命令行 > 环境变量 > 本文件 > 默认值
+
+# 全局选项：必须写在任何 [section] 之前
+workers = 1            # 发送并发数，默认 1（串行最不容易触发限流）
+log_level = "INFO"     # DEBUG / INFO / WARN / ERROR
+
+[telegram]
+# 必填：@BotFather 给的 token
+token = "123456789:AAE-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+# 必填：接收方，支持多个。私聊填数字 id，频道填 @channelname 或 -100xxxxxxxxxx
+# 机器人需要是频道/群的管理员，或者你先给机器人发过消息
+chat_id = "-1001234567890"
+# 多个接收方：字符串或数组都行（数字可以不写引号），每个文件都会发给每一个
+# chat_id = ["-1001234567890", "@mychannel", -1009876543210]
+# 可选：自建 local Bot API server 时改成 http://127.0.0.1:8081，上传上限可提到 2000MB
+api_base = "https://api.telegram.org"
+# 可选：两条消息之间的最小间隔（秒），默认 1
+min_send_interval = 1.0
+# 可选：HTTP 超时秒数，默认 120
+timeout = 120
+# 可选：单次上传的最大尝试次数，默认 3
+max_retries = 3
+
+[proxy]
+# 可选：留空 = 直连
+#   socks5://[user:pass@]host:port
+#   http://[user:pass@]host:port
+url = "socks5://user:password@127.0.0.1:1080"
+
+[watch]
+# 必填：要监控的目录，可写多个，子目录自动包含
+dirs = ["/data/media", "/srv/incoming"]
+# 可选：扫描间隔秒数，默认 2
+poll_interval = 2.0
+# 可选：文件不再变化多少秒后才发送，默认 3（用来躲开"还在拷贝"的大文件）
+settle_seconds = 3.0
+# 可选：小于该字节数的文件忽略，默认 1024
+min_size = 1024
+# 可选：忽略的文件名模式（默认已忽略 .part/.tmp/.crdownload 等临时文件）
+exclude = ["*.part", "*.tmp", "*.crdownload", "*.download", "*.partial"]
+# 说明：常驻模式只发送启动之后新增/变化的文件，启动时就存在的文件一律不管。
+# 配置里保留 scan_existing 只是为了兼容旧配置，常驻模式会忽略它并打一条警告；
+# 想补发目录里已有的文件请单独跑：filebot once -c config.toml
+# 可选：发送记录文件，重启后不重复推送同一个文件版本
+state_file = "~/.local/state/filebot/state.json"
+
+[upload]
+# 可选：发送原文件（sendDocument，不压缩，点击后当文件下载）
+send_original = true
+# 可选：发送可直接点开查看的版本（图片 sendPhoto / 动图 sendAnimation / 视频 sendVideo）
+send_compressed = true
+# 可选：原文件上传上限 MB。官方 API 是 50；自建 local Bot API server 可设 2000
+max_upload_mb = 50
+# 可选：图片内联上限 MB（官方 API 限制 10）
+photo_max_mb = 10
+# 可选：视频内联上限 MB（官方 API 限制 50）
+video_max_mb = 50
+# 可选：消息标题模板，可用 {name} {size} {path} {dir} {kind}
+caption_template = "{name}\n{size} · {path}"
+# 可选：原文件因超限被跳过时，额外发一条文字提醒，默认 false
+notify_skipped = false

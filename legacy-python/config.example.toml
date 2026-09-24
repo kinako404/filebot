@@ -1,0 +1,76 @@
+# filebot 配置示例
+#
+# 复制成 config.toml 后按需修改：
+#   cp config.example.toml config.toml
+#   python3 bot.py -c config.toml --check
+#
+# 优先级：命令行 > 环境变量 > 本文件 > 默认值
+
+# 全局选项（必须写在任何 [section] 之前）
+# workers = 1            # 发送线程数，默认 1（串行最不容易触发限流）
+# log_level = "INFO"     # DEBUG / INFO / WARNING / ERROR
+
+[telegram]
+# 必填：@BotFather 给的 token
+token = "123456789:AAE-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# 必填：接收方。私聊填自己的数字 id，频道填 @channelname 或 -100xxxxxxxxxx
+# 注意：机器人需要先是频道/群的管理员，或者你先给机器人发过消息
+chat_id = "-1001234567890"
+
+# 可选：Bot API 地址。默认官方 https://api.telegram.org（上传上限 50MB）
+# 自建 local Bot API server 时可改成 http://127.0.0.1:8081，上限提升到 2000MB
+api_base = "https://api.telegram.org"
+
+# 可选：两次发送之间的最小间隔（秒），防止触发限流（默认 1.0）
+min_send_interval = 1.0
+
+# 可选：网络请求超时秒数（默认 120）
+timeout = 120
+# 可选：失败重试次数（默认 3）
+max_retries = 3
+
+[proxy]
+# 可选：代理链接，留空表示直连。
+#   ss://...            内置 Shadowsocks AEAD-2017 客户端（见 README 的支持范围）
+#   socks5://[user:pass@]host:port
+#   http://[user:pass@]host:port
+url = "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@1.2.3.4:8388#my-node"
+
+[watch]
+# 必填：要监控的目录，可写多个，子目录自动包含
+dirs = ["/data/media", "/srv/incoming"]
+
+# 可选：扫描间隔秒数（默认 2）
+poll_interval = 2.0
+# 可选：文件不再变化多少秒后才发送（默认 3），用来躲开"还在拷贝"的大文件
+settle_seconds = 3.0
+# 可选：小于该字节数的文件忽略（默认 1024）
+min_size = 1024
+# 可选：忽略的文件名模式（fnmatch），默认已忽略 .part/.tmp/.crdownload 等临时文件
+exclude = ["*.part", "*.tmp", "*.crdownload", "*.download", "*.partial"]
+
+# 可选：启动时是否把目录里已有的文件也发一遍（默认 false，只发启动后新增/变化的）
+scan_existing = false
+
+# 可选：发送记录文件，重启后不会重复推送同一个文件版本
+state_file = "~/.local/state/filebot/state.json"
+
+[upload]
+# 可选：是否发送原文件（sendDocument，不压缩，点击后当文件下载）
+send_original = true
+# 可选：是否发送可直接点开查看的版本（图片 sendPhoto / 动图 sendAnimation / 视频 sendVideo）
+send_compressed = true
+
+# 可选：原文件上传上限 MB。官方 API 是 50，自建 local Bot API server 可设 2000
+max_upload_mb = 50
+# 可选：图片内联上限 MB（官方 API 限制 10）
+photo_max_mb = 10
+# 可选：视频内联上限 MB（官方 API 限制 50）
+video_max_mb = 50
+
+# 可选：消息标题模板，可用 {name} {size} {path} {dir} {kind}
+caption_template = "{name}\n{size} · {path}"
+
+# 可选：原文件因超限被跳过时，是否额外发一条文字提醒（默认 false）
+notify_skipped = false

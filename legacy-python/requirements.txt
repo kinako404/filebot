@@ -1,0 +1,16 @@
+# filebot 运行时零依赖（纯 Python 标准库），本文件默认不安装任何东西。
+#
+# 可选增强，装了更好：
+#   cryptography  硬件加速的 AES-GCM / ChaCha20-Poly1305
+#                 没装时 chacha20-ietf-poly1305 走内置纯 Python 实现（可用但慢），
+#                 aes-*-gcm 节点则会直接报错提示安装
+#   Pillow        图片转 JPEG（BMP/WebP/HEIC/TIFF 等），比 ffmpeg 更省事
+#
+# 系统命令（有就用，没有就只发原文件）：
+#   ffmpeg        视频转 MP4 / 图片转 JPEG
+#   ImageMagick   图片转 JPEG（magick 或 convert）
+#
+# Debian/Ubuntu:
+#   sudo apt install python3-cryptography ffmpeg
+# 或:
+#   pip install cryptography Pillow
