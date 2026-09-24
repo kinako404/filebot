@@ -19,7 +19,7 @@ import (
 )
 
 // Version 是构建版本号，构建时可用 -ldflags 覆盖。
-var Version = "2.0.0"
+var Version = "2.1.1"
 
 const usage = `filebot - 监控目录，把新增/更新的图片、视频发送到 Telegram
 
